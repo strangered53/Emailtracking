@@ -458,7 +458,22 @@ def generate_dork_links(addr: str, username: str, domain: str) -> list[dict]:
     base = "https://www.google.com/search?q="
     return [{"label": l, "url": base + quote_plus(q)} for l, q in dorks]
 
-def run_osint(addr: str, no_social: bool = False) -> dict:
+def resolve_domain_ips(domain: str) -> list[str]:
+    """Resolve domain A records via Google DNS-over-HTTPS."""
+    try:
+        data = http_get(
+            f"https://dns.google/resolve?name={domain}&type=A",
+            json_resp=True
+        )
+        if data and data.get("Answer"):
+            return list(dict.fromkeys(
+                r["data"] for r in data["Answer"] if r.get("type") == 1
+            ))
+    except Exception:
+        pass
+    return []
+
+def run_osint(addr: str, no_social: bool = False, no_geo: bool = False) -> dict:
     """Run full OSINT on an email address. Returns results dict."""
     addr = addr.strip().lower()
     struct = validate_email_addr(addr)
@@ -476,6 +491,27 @@ def run_osint(addr: str, no_social: bool = False) -> dict:
     info("Looking up MX / WHOIS...")
     mx    = dns_mx_lookup(domain)
     whois = whois_domain(domain)
+
+    # ── IP Geolocation of mail server ────────────────────────────────────────
+    geo_results = []
+    if not no_geo:
+        info("Resolving domain IPs for geolocation...")
+        domain_ips = resolve_domain_ips(domain)
+        # Also try to resolve MX hostnames
+        mx_ips = []
+        for mx_record in mx[:2]:
+            mx_host = mx_record.split()[-1].rstrip(".")  # strip priority + trailing dot
+            resolved = resolve_domain_ips(mx_host)
+            mx_ips.extend(resolved)
+        all_ips = list(dict.fromkeys(domain_ips + mx_ips))[:5]
+        if all_ips:
+            info(f"Geolocating {len(all_ips)} mail server IP(s)...")
+            for ip in all_ips:
+                geo = geolocate_ip(ip)
+                geo_results.append(geo)
+                ok(f"Server IP {ip} → {geo.get('city','?')}, {geo.get('country','?')} ({geo.get('isp','?')})")
+        else:
+            warn("Could not resolve any IPs for this domain")
 
     info("Checking Gravatar (profile + avatar fallback)...")
     gravatar = check_gravatar(addr)
@@ -504,6 +540,7 @@ def run_osint(addr: str, no_social: bool = False) -> dict:
 
     return {
         "email": addr, "struct": struct, "mx": mx, "whois": whois,
+        "geo": geo_results,
         "gravatar": gravatar, "social_hits": social_hits,
         "social_miss": social_miss, "hibp": hibp, "dorks": dorks,
     }
@@ -528,6 +565,16 @@ def print_osint_report(r: dict):
         found("Status",     r["whois"].get("status","N/A"))
     else:
         warn("WHOIS/RDAP data unavailable")
+
+    section("🗺️   MAIL SERVER GEOLOCATION")
+    if r.get("geo"):
+        for geo in r["geo"]:
+            print(f"\n  {C.BOLD}IP: {geo.get('query','?')}{C.RESET}")
+            print(f"  {'Location:':<14} {geo.get('city','?')}, {geo.get('regionName','?')}, {geo.get('country','?')}")
+            print(f"  {'ISP/Org:':<14} {geo.get('isp','?')} / {geo.get('org','?')}")
+        print(f"\n  {C.DIM}Note: This is the mail SERVER location, not the sender's personal location.{C.RESET}")
+    else:
+        warn("No geolocation data available")
 
     section("🖼️   GRAVATAR PROFILE")
     if r["gravatar"].get("found"):
@@ -674,7 +721,7 @@ def main():
             if m:
                 sender_email = m.group(0).lower()
                 section(f"🔬  AUTO-OSINT ON SENDER:  {sender_email}")
-                osint_data = run_osint(sender_email, no_social=args.no_social)
+                osint_data = run_osint(sender_email, no_social=args.no_social, no_geo=args.no_geo)
                 if osint_data:
                     print_osint_report(osint_data)
             else:
@@ -683,7 +730,7 @@ def main():
     # ── STANDALONE OSINT ──────────────────────────────────────────────────────
     if args.email:
         section(f"🔬  OSINT MODE:  {args.email}")
-        osint_data = run_osint(args.email, no_social=args.no_social)
+        osint_data = run_osint(args.email, no_social=args.no_social, no_geo=args.no_geo)
         if osint_data:
             print_osint_report(osint_data)
 
